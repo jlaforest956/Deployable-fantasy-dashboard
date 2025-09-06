@@ -1,14 +1,12 @@
-# Python
+# secrets
+.env
+
+# python stuff
 __pycache__/
 *.pyc
 
-# Virtual env
-.venv/
-
-# Secrets & local-only
-.env
-Refs/
-
-# OS junk
+# OS/editor
 .DS_Store
-Thumbs.db
+.vscode/
+.idea/
+.venv/
