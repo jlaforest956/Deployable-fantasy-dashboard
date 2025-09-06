@@ -1,106 +1,108 @@
 # app.py
-import os
-from flask import Flask, render_template, jsonify
-from assess import get_report  # must return (payload, report_or_none, raw_text)
+from flask import Flask, render_template, jsonify, redirect, url_for
+from assess import get_report
+import json, time, os
 
-app = Flask(__name__, static_folder="static", template_folder="templates")
+app = Flask(__name__)
 
-
-def _safe_numbers(payload):
-    """Pull projections safely from payload."""
-    proj = payload.get("proj") or {}
-    try:
-        me = float(proj.get("me", 0) or 0)
-    except Exception:
-        me = 0.0
-    try:
-        opp = float(proj.get("opp", 0) or 0)
-    except Exception:
-        opp = 0.0
-    return me, opp
+CACHE = {"ts": 0, "payload": None, "report": None, "raw": None}
+CACHE_TTL = 60  # seconds
 
 
-@app.route("/")
-def index():
-    """
-    Main dashboard.
-    - Calls assess.get_report()
-    - Builds `meta` (team/opponent/league/week/projections/strategy)
-    - Renders templates/index.html
-    """
-    try:
-        payload, ai_report, raw = get_report()
-    except Exception as e:
-        # Failsafe: keep the page up even if ESPN/OpenAI hiccup
-        payload, ai_report, raw = (
-            {
-                "team": "—",
-                "opponent": "—",
-                "league": "—",
-                "week": 0,
-                "proj": {"me": 0, "opp": 0},
-                "strategy_bias": "floor",
-                "my_starters": [],
-                "my_bench": [],
-                "free_agents_top": [],
-                "local_swap_candidates": [],
-            },
-            None,
-            f"ERROR calling get_report(): {e}",
-        )
-
-    me_proj, opp_proj = _safe_numbers(payload)
-
-    meta = {
-        "team": payload.get("team", "—"),
-        "opponent": payload.get("opponent", "—"),
-        "league": payload.get("league", "—"),
-        "week": payload.get("week", 0),
-        "proj_me": me_proj,
-        "proj_opp": opp_proj,
-        "strategy": payload.get("strategy_bias", "floor"),
-    }
-
-    return render_template(
-        "index.html",
-        payload=payload,
-        report=ai_report,  # may be None if OpenAI was skipped or rate-limited
-        raw=raw,           # raw AI text (for the collapsible debug)
-        meta=meta,         # <-- template expects this
-    )
+def deep_convert(obj):
+    """Recursively convert non-JSON types (e.g., set) to JSON-safe ones."""
+    if isinstance(obj, dict):
+        return {k: deep_convert(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [deep_convert(x) for x in obj]
+    if isinstance(obj, set):
+        return [deep_convert(x) for x in obj]
+    return obj
 
 
-@app.route("/json")
-def json_dump():
-    """Raw JSON for debugging / API-like usage."""
-    try:
-        payload, ai_report, raw = get_report()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+def refresh_cache(force=False):
+    now = time.time()
+    if (not force) and CACHE["payload"] and (now - CACHE["ts"] < CACHE_TTL):
+        return CACHE["payload"], CACHE["report"], CACHE["raw"]
 
-    return jsonify(
-        {
-            "meta": {
-                "team": payload.get("team", "—"),
-                "opponent": payload.get("opponent", "—"),
-                "league": payload.get("league", "—"),
-                "week": payload.get("week", 0),
-                "proj": payload.get("proj", {"me": 0, "opp": 0}),
-                "strategy": payload.get("strategy_bias", "floor"),
-            },
-            "payload": payload,
-            "report": ai_report,  # can be None
-            "raw": raw,
-        }
-    )
+    payload, report, raw = get_report()
+    CACHE["ts"] = now
+    CACHE["payload"] = payload
+    CACHE["report"] = report
+    CACHE["raw"] = raw
+    return payload, report, raw
 
 
 @app.route("/healthz")
 def health():
-    return "ok", 200
+    return "OK", 200
+
+
+@app.route("/json")
+def json_api():
+    payload, report, raw = refresh_cache()
+    safe_payload = deep_convert(payload)
+    if report is None:
+        return jsonify({"error": "model returned non-JSON", "raw": raw, "payload": safe_payload}), 200
+    return jsonify({"payload": safe_payload, "report": deep_convert(report)}), 200
+
+
+@app.route("/refresh")
+def refresh():
+    refresh_cache(force=True)
+    return redirect(url_for("index"))
+
+
+@app.route("/cron")
+def cron():
+    payload, report, raw = refresh_cache(force=True)
+    # write a snapshot (Render health/cron-friendly)
+    try:
+        with open("/tmp/report.json", "w", encoding="utf-8") as f:
+            json.dump({"payload": payload, "report": report, "raw": raw}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return "OK", 200
+
+
+@app.route("/")
+def index():
+    payload, data, raw = refresh_cache()
+
+    # name → float projection
+    wk_by_name = {p["name"]: p["wk_proj"] for p in (payload["my_starters"] + payload["my_bench"])}
+    # name → player dict
+    players_by_name = {p["name"]: p for p in (payload["my_starters"] + payload["my_bench"])}
+
+    # For hybrid hint: map "sit name" → swap object (from local optimizer)
+    local_hints = {sw["sit"]["name"]: sw for sw in payload.get("local_swap_candidates", [])}
+
+    if data is None:
+        return render_template(
+            "index.html",
+            payload=payload,
+            report=None,
+            raw_text=raw,
+            wk_by_name=wk_by_name,
+            players_by_name=players_by_name,
+            start_sit_by_slot={},
+            local_hints=local_hints,
+        ), 200
+
+    start_sit_by_slot = {row["slot"]: row for row in data.get("start_sit", [])}
+
+    return render_template(
+        "index.html",
+        payload=payload,
+        report=data,
+        raw_text=None,
+        wk_by_name=wk_by_name,
+        players_by_name=players_by_name,
+        start_sit_by_slot=start_sit_by_slot,
+        local_hints=local_hints,
+    ), 200
 
 
 if __name__ == "__main__":
-    # Local dev server; Render will use gunicorn per your start command
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
