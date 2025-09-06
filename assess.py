@@ -1,117 +1,87 @@
 # assess.py
-# ESPN → normalized payload (starters/bench/FA with live & projections)
-# OpenAI → executive summary + waivers/trades/risks (no start/sit from AI)
-#
-# Returns: (payload: dict, ai: dict|None, raw_text_if_fail: str)
-
-import os, json
-from typing import Any, Dict, List, Tuple, Optional
+import os, json, time, random
+from typing import Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from espn_api.football import League
 from openai import OpenAI
+from openai import RateLimitError
 
 # ---------------- ENV ----------------
-def _env() -> Dict[str, Any]:
+def load_env():
     load_dotenv(override=True)
-    need = ["LEAGUE_ID", "ESPN_S2", "SWID", "OPENAI_API_KEY"]
-    miss = [k for k in need if not os.environ.get(k)]
-    if miss:
-        raise RuntimeError(f"Missing env: {', '.join(miss)}")
+    required = ["LEAGUE_ID", "ESPN_S2", "SWID", "OPENAI_API_KEY"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        raise RuntimeError(f"Missing env: {', '.join(missing)}")
     return {
         "LEAGUE_ID": int(os.environ["LEAGUE_ID"]),
         "YEAR": int(os.environ.get("YEAR", "2025")),
         "ESPN_S2": os.environ["ESPN_S2"],
         "SWID": os.environ["SWID"],
         "TEAM_NAME": os.environ.get("TEAM_NAME", "AI Replacements"),
-        "MODEL": os.environ.get("OPENAI_MODEL", "gpt-4-turbo"),
+        # Use a lighter model by default to avoid 429s and reduce token use
+        "MODEL": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        # Cache ttl in seconds (15 min)
+        "AI_CACHE_TTL": int(os.environ.get("AI_CACHE_TTL", "900")),
     }
 
 # ------------- HELPERS ---------------
-# Order we want to display the starting slots
 START_SLOTS = ("QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "D/ST", "K")
 
-def _normalize_slot(s: str) -> str:
-    s = (s or "").upper().replace(" ", "")
+def normalize_slot(slot: str) -> str:
+    if not slot:
+        return ""
+    s = str(slot).upper().replace(" ", "")
     if s in {"RB/WR/TE", "W/R/T", "WR/RB/TE", "RBWRTE"}:
         return "FLEX"
     if s in {"DST", "DEF"}:
         return "D/ST"
-    return s
+    return slot
 
-def _slot_from_player(p) -> str:
-    raw = getattr(p, "lineupSlot", None) or getattr(p, "slot_position", None) or ""
-    return _normalize_slot(str(raw))
-
-def _team_str(val) -> str:
+def safe_team(val):
     try:
-        if hasattr(val, "name"):
-            return str(val.name)
-        return str(val)
+        return str(val.name) if hasattr(val, "name") else str(val)
     except Exception:
         return str(val)
 
-def _float(x, default=0.0) -> float:
-    try:
-        if isinstance(x, (int, float)):
-            return float(x)
-        if isinstance(x, str):
-            return float(x)
-    except Exception:
-        pass
-    return float(default)
+def get_slot(player) -> str:
+    raw = getattr(player, "lineupSlot", None) or getattr(player, "slot_position", None) or ""
+    return normalize_slot(str(raw))
 
-def _week_proj(p, week: int) -> float:
-    # 1) direct projected_points if present
-    v = getattr(p, "projected_points", None)
-    if isinstance(v, (int, float)):
+def week_proj(player, week: int) -> float:
+    v = getattr(player, "projected_points", None)
+    if isinstance(v, (int, float)) and v >= 0:
         return float(v)
-
-    # 2) stats dict
-    stats = getattr(p, "stats", None)
+    stats = getattr(player, "stats", None)
     if isinstance(stats, dict):
         wk = stats.get(week) or stats.get(str(week)) or {}
-        v = wk.get("projected_points") or wk.get("projected_total_points") or wk.get("projected")
-        if isinstance(v, (int, float)):
+        v = wk.get("projected_points") or wk.get("projected_total_points")
+        if isinstance(v, (int, float)) and v >= 0:
             return float(v)
-
-    # 3) season projected / 17
-    season = getattr(p, "projected_total_points", None)
+    season = getattr(player, "projected_total_points", None)
     if isinstance(season, (int, float)) and season > 0:
         return float(season) / 17.0
-
     return 0.0
 
-def _week_actual(p, week: int) -> float:
-    # try a few common keys ESPN lib uses
-    stats = getattr(p, "stats", None)
-    if isinstance(stats, dict):
-        wk = stats.get(week) or stats.get(str(week)) or {}
-        for k in ("points", "total_points", "applied_total", "actual_points", "scoring_period_points"):
-            if k in wk and isinstance(wk[k], (int, float)):
-                return float(wk[k])
-    # sometimes `points` is directly on the object (rare)
-    v = getattr(p, "points", None)
-    if isinstance(v, (int, float)):
-        return float(v)
-    return 0.0
-
-def _pack_player(p, week: int) -> Dict[str, Any]:
+def pack_player(player, week: int) -> dict:
+    # Try to grab bye info if present; otherwise set None (your template prints "None")
+    bye_week = getattr(player, "bye_week", None)
     return {
-        "name": str(p.name),
-        "pos": str(p.position),
-        "team": _team_str(getattr(p, "proTeam", "")),
-        "slot": _slot_from_player(p),
-        "wk_proj": round(_week_proj(p, week), 2),
-        "wk_actual": round(_week_actual(p, week), 2),
-        "status": getattr(p, "injuryStatus", "") or "",
-        "bye": None,  # ESPN lib doesn’t always expose bye per player; we show "None" consistently in UI
+        "name": player.name,
+        "pos": player.position,
+        "team": safe_team(getattr(player, "proTeam", "")),
+        "slot": get_slot(player),
+        "wk_proj": round(week_proj(player, week), 2),
+        "status": getattr(player, "injuryStatus", "") or "",
+        "bye": bye_week if isinstance(bye_week, (int, str)) else None,
+        # live actual if available on ESPN object (often 0 outside live window)
+        "wk_actual": float(getattr(player, "points", 0.0) or 0.0),
     }
 
-def _sum_proj(players: List[Dict[str, Any]]) -> float:
-    return round(sum(_float(p.get("wk_proj", 0.0)) for p in players), 2)
+def sum_proj(players) -> float:
+    return round(sum(p["wk_proj"] for p in players), 2)
 
-def _bench_swaps(starters: List[Dict[str, Any]], bench: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Find simple local upgrades: if any bench player outprojects current starter in that slot."""
+def bench_swaps(starters: list, bench: list) -> list:
     swaps = []
     bench_by_pos = {
         "QB":  [b for b in bench if b["pos"] == "QB"],
@@ -126,101 +96,154 @@ def _bench_swaps(starters: List[Dict[str, Any]], bench: List[Dict[str, Any]]) ->
         pool = bench_by_pos["FLEX"] if s["slot"] == "FLEX" else bench_by_pos.get(s["pos"], [])
         if not pool:
             continue
-        best = max(pool, key=lambda x: _float(x["wk_proj"]), default=None)
-        if best and _float(best["wk_proj"]) > _float(s["wk_proj"]):
+        best = max(pool, key=lambda x: x["wk_proj"], default=None)
+        if best and best["wk_proj"] > s["wk_proj"]:
             swaps.append({
                 "slot": s["slot"],
-                "sit": {"name": s["name"], "pos": s["pos"], "wk_proj": _float(s["wk_proj"])},
-                "start": {"name": best["name"], "pos": best["pos"], "wk_proj": _float(best["wk_proj"])},
-                "delta": round(_float(best["wk_proj"]) - _float(s["wk_proj"]), 2),
+                "sit": {"name": s["name"], "pos": s["pos"], "wk_proj": s["wk_proj"]},
+                "start": {"name": best["name"], "pos": best["pos"], "wk_proj": best["wk_proj"]},
+                "delta": round(best["wk_proj"] - s["wk_proj"], 2),
             })
     swaps.sort(key=lambda x: x["delta"], reverse=True)
     return swaps
 
 # -------------- CORE -----------------
-def build_payload() -> Dict[str, Any]:
-    cfg = _env()
+def build_payload() -> dict:
+    cfg = load_env()
     league = League(
         league_id=cfg["LEAGUE_ID"],
         year=cfg["YEAR"],
         espn_s2=cfg["ESPN_S2"],
         swid=cfg["SWID"],
     )
-    week = int(league.current_week)
-
-    # My team & opponent
+    week = league.current_week
     me = next(t for t in league.teams if t.team_name == cfg["TEAM_NAME"])
+
+    # Scoreboard + opponent
     sb = league.scoreboard(week)
     my_match = next(m for m in sb if me in (m.home_team, m.away_team))
     opp = my_match.away_team if my_match.home_team == me else my_match.home_team
 
-    # Pack rosters
-    my_all = [_pack_player(p, week) for p in me.roster]
-    opp_all = [_pack_player(p, week) for p in opp.roster]
+    # My roster (starters + bench)
+    my_all = [pack_player(p, week) for p in me.roster]
+    start_labels = set(START_SLOTS)
+    my_starters = [p for p in my_all if p["slot"] in start_labels]
+    my_bench = [p for p in my_all if p["slot"] not in start_labels]
 
-    # Starters/bench using actual lineupSlot (prevents duplicates & respects two RB/two WR)
-    start_label_set = {"QB", "RB", "WR", "TE", "FLEX", "D/ST", "K"}
-    my_starters = [p for p in my_all if p["slot"] in start_label_set]
-    my_bench    = [p for p in my_all if p["slot"] not in start_label_set]
+    slot_rank = {slot: i for i, slot in enumerate(START_SLOTS)}
+    my_starters_sorted = sorted(my_starters, key=lambda x: slot_rank.get(x["slot"], 999))
 
-    # Sort starters into the fixed slot order
-    order_index = {slot: i for i, slot in enumerate(START_SLOTS)}
-    # stable sort: by slot index then by projected points desc (so the higher RB/WR is listed first)
-    my_starters_sorted = sorted(
-        my_starters, key=lambda x: (order_index.get(x["slot"], 99), -_float(x["wk_proj"]))
-    )
+    # Opponent starters
+    opp_all = [pack_player(p, week) for p in opp.roster]
+    opp_starters = [p for p in opp_all if p["slot"] in start_labels]
 
-    opp_starters = [p for p in opp_all if p["slot"] in start_label_set]
-
-    # Projections: ESPN sometimes returns 0.0 until closer to kickoff; fallback to our sum if 0–0
-    my_proj_raw  = my_match.home_score if my_match.home_team == me else my_match.away_score
+    # Projections: if ESPN gives zeros, fall back to sum of our wk_proj
+    my_proj_raw = my_match.home_score if my_match.home_team == me else my_match.away_score
     opp_proj_raw = my_match.away_score if my_match.home_team == me else my_match.home_score
-    my_proj = round(_float(my_proj_raw), 2)
-    opp_proj = round(_float(opp_proj_raw), 2)
+    my_proj = round(float(my_proj_raw or 0.0), 2)
+    opp_proj = round(float(opp_proj_raw or 0.0), 2)
     if my_proj == 0.0 and opp_proj == 0.0:
-        my_proj, opp_proj = _sum_proj(my_starters_sorted), _sum_proj(opp_starters)
+        my_proj, opp_proj = sum_proj(my_starters_sorted), sum_proj(opp_starters)
 
     underdog = my_proj < opp_proj
 
-    # Free agents
-    fas = [
-        _pack_player(p, week) for p in league.free_agents(size=80)
+    # Free agents (trim to 20 to reduce tokens)
+    fa = [
+        pack_player(p, week) for p in league.free_agents(size=60)
         if getattr(p, "position", "") in {"QB", "RB", "WR", "TE", "K", "D/ST"}
     ]
-    fas.sort(key=lambda x: _float(x["wk_proj"]), reverse=True)
-    fas_top = fas[:40]
+    fa.sort(key=lambda x: x["wk_proj"], reverse=True)
+    fa_top = fa[:20]
 
-    swaps = _bench_swaps(my_starters_sorted, my_bench)
+    local_swaps = bench_swaps(my_starters_sorted, my_bench)
 
-    return {
-        "week": week,
+    payload = {
+        "week": int(week),
         "league": str(league.settings.name),
         "team": str(me.team_name),
         "opponent": str(opp.team_name),
-        "proj": {"me": my_proj, "opp": opp_proj},
+        "proj": {"me": float(my_proj), "opp": float(opp_proj)},
         "strategy_bias": "ceiling" if underdog else "floor",
         "scoring": "0.5 PPR; ESPN defaults.",
         "my_starters": my_starters_sorted,
-        "my_bench": sorted(my_bench, key=lambda x: _float(x["wk_proj"]), reverse=True),
-        "free_agents_top": fas_top,
-        "local_swap_candidates": swaps,
-        "_model": _env()["MODEL"],
+        "my_bench": sorted(my_bench, key=lambda x: x["wk_proj"], reverse=True),
+        "free_agents_top": fa_top,
+        "local_swap_candidates": local_swaps,
+        "_model": cfg["MODEL"],
     }
+    return payload
+
+# --------- AI (retry + cache) --------
+_CACHE_PATH = "/tmp/ai_summary_cache.json"
+
+def _load_cache() -> Optional[Dict[str, Any]]:
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_cache(data: Dict[str, Any]) -> None:
+    try:
+        with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def _cache_key(payload: Dict[str, Any]) -> str:
+    # Cache by (week, team) so each week re-runs, but refreshes within 15m reuse
+    return f"wk{payload.get('week')}-{payload.get('team')}"
+
+def _chat_with_retry(client: OpenAI, **kwargs):
+    # Backoff for 429s
+    for i in range(4):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except RateLimitError:
+            time.sleep((2 ** i) + random.random())
+    return None
 
 def get_report() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], str]:
-    """
-    Return (payload, ai_dict, raw_text_if_fail).
-    We ask OpenAI only for: executive_summary, waivers, trades, risks.
-    Start/Sit is computed locally to avoid duplicates / illegal lineups.
-    """
+    cfg = load_env()
     payload = build_payload()
-    client = OpenAI()
-    model = payload["_model"]
 
+    # ---------- cache short-circuit ----------
+    cache = _load_cache() or {}
+    key = _cache_key(payload)
+    item = cache.get(key)
+    now = time.time()
+    if item and (now - item.get("ts", 0)) < cfg["AI_CACHE_TTL"]:
+        return payload, item.get("ai"), item.get("raw", "")
+
+    # ---------- build compact prompt ----------
     schema = {
         "type": "object",
         "properties": {
-            "executive_summary": {"type": "string"},
+            "start_sit": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "slot": {"type": "string"},
+                        "starter": {"type": "string"},
+                        "verdict": {"type": "string"},  # "Start" or "Bench for <name>"
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["slot", "starter", "verdict", "reason"],
+                },
+            },
+            "bench_ranked": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "pos": {"type": "string"},
+                        "wk_proj": {"type": "number"},
+                    },
+                    "required": ["name", "pos", "wk_proj"],
+                },
+            },
             "waivers": {
                 "type": "array",
                 "items": {
@@ -228,10 +251,10 @@ def get_report() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], str]:
                     "properties": {
                         "add": {"type": "string"},
                         "drop": {"type": "string"},
-                        "why": {"type": "string"}
+                        "why": {"type": "string"},
                     },
-                    "required": ["add", "drop", "why"]
-                }
+                    "required": ["add", "drop", "why"],
+                },
             },
             "trades": {
                 "type": "array",
@@ -239,44 +262,63 @@ def get_report() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], str]:
                     "type": "object",
                     "properties": {
                         "target": {"type": "string"},
-                        "why": {"type": "string"}
+                        "why": {"type": "string"},
                     },
-                    "required": ["target", "why"]
-                }
+                    "required": ["target", "why"],
+                },
             },
-            "risks": {"type": "array", "items": {"type": "string"}}
-        }
+            "risks": {"type": "array", "items": {"type": "string"}},
+            "exec_summary": {"type": "string"},
+        },
+        "required": ["start_sit", "bench_ranked", "waivers", "trades", "risks", "exec_summary"],
     }
 
-    system = (
-        "You are a precise fantasy football analyst. "
-        "Respond with a SINGLE JSON object (no prose, no code fences)."
+    # Send only the fields AI needs; keep it compact
+    lean_payload = {
+        "week": payload["week"],
+        "team": payload["team"],
+        "opponent": payload["opponent"],
+        "proj": payload["proj"],
+        "strategy_bias": payload["strategy_bias"],
+        "my_starters": [{k: p[k] for k in ("name","pos","team","slot","wk_proj","status","bye","wk_actual")} for p in payload["my_starters"]],
+        "my_bench": [{k: p[k] for k in ("name","pos","team","wk_proj","status","bye")} for p in payload["my_bench"][:12]],  # top 12
+        "free_agents_top": [{k: p[k] for k in ("name","pos","team","wk_proj","status")} for p in payload["free_agents_top"]],  # 20 max
+        "local_swap_candidates": payload["local_swap_candidates"][:5],
+    }
+
+    system_msg = (
+        "You are an expert fantasy football analyst. "
+        "Use ceiling if underdog, floor if favorite. "
+        "Return ONLY valid JSON; no backticks."
     )
-    user = f"""
-Return STRICT JSON that validates against this schema:
+    user_prompt = (
+        "Output valid JSON (no prose) for this schema:\n"
+        f"{json.dumps(schema)}\n\n"
+        "Guidelines:\n"
+        "- For each starter slot in my_starters, produce a row in start_sit with a short reason.\n"
+        "- verdict must be 'Start' or 'Bench for <bench name>'.\n"
+        "- bench_ranked: return my_bench sorted by wk_proj.\n"
+        "- waivers: top 3 adds from free_agents_top, each paired with a real bench drop.\n"
+        "- trades: 1–2 realistic targets.\n"
+        "- risks: 3 short bullets.\n"
+        "- exec_summary: 2–4 sentences summarizing matchup, strategy, and key moves.\n\n"
+        f"League JSON:\n{json.dumps(lean_payload)}"
+    )
 
-{json.dumps(schema)}
-
-Write:
-- executive_summary: 2–4 sentences tailored to the matchup and 'strategy_bias'.
-  Mention swing spots (e.g., bench upgrades from local_swap_candidates), injuries/status,
-  and where the edge likely comes from.
-- waivers: pick 3 smart adds from free_agents_top and pair with realistic drops from my_bench.
-- trades: 1–2 realistic targets with short reasons.
-- risks: 2–4 bullets highlighting lineup/volatility/weather/injury concerns.
-
-League JSON (for context):
-{json.dumps(payload)}
-"""
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+    client = OpenAI()
+    resp = _chat_with_retry(
+        client,
+        model=cfg["MODEL"],
+        messages=[{"role": "system", "content": system_msg},
+                  {"role": "user", "content": user_prompt}],
         temperature=0.2,
     )
-    raw = resp.choices[0].message.content or ""
+    raw = ""
+    ai = None
+    if resp and resp.choices and resp.choices[0].message:
+        raw = resp.choices[0].message.content or ""
 
-    def strip_fences(text: str) -> str:
+    def strip_code_fences(text: str) -> str:
         t = text.strip()
         if t.startswith("```"):
             t = "\n".join(t.splitlines()[1:])
@@ -284,10 +326,17 @@ League JSON (for context):
             t = "\n".join(t.splitlines()[:-1])
         if "{" in t and "}" in t:
             t = t[t.find("{"): t.rfind("}") + 1]
-        return t
+        return t.strip()
 
-    try:
-        data = json.loads(strip_fences(raw))
-        return payload, data, ""
-    except Exception:
-        return payload, None, raw
+    if raw:
+        cleaned = strip_code_fences(raw)
+        try:
+            ai = json.loads(cleaned)
+        except Exception:
+            ai = None
+
+    # cache result (even if None, we cache raw to avoid spamming)
+    cache[key] = {"ts": time.time(), "ai": ai, "raw": raw}
+    _save_cache(cache)
+
+    return payload, ai, raw

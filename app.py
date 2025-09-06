@@ -132,11 +132,25 @@ def json_dump():
 def health():
     return "ok", 200
 
+# app.py (inside index route)
+from flask import Flask, render_template, jsonify
+app = Flask(__name__)
+
 @app.route("/")
 def index():
+    from assess import get_report
     payload, ai, raw = get_report()
-    vm = build_view_models(payload, ai)
-    return render_template("index.html", **vm)
+    # Ensure defaults for template
+    ai = ai or {
+        "start_sit": [],
+        "bench_ranked": [],
+        "waivers": [],
+        "trades": [],
+        "risks": ["AI summary temporarily unavailable (rate limit)."],
+        "exec_summary": "Executive summary temporarily unavailable due to rate limiting. Data sections still live."
+    }
+    return render_template("index.html", payload=payload, report=ai, raw=raw)
+
 
 if __name__ == "__main__":
     import os
