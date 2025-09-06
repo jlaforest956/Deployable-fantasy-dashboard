@@ -139,4 +139,5 @@ def index():
     return render_template("index.html", **vm)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import os
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
