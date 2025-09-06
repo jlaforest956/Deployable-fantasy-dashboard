@@ -1,0 +1,53 @@
+/* static/styles.css — dark, stacked dashboard */
+:root{
+  --bg:#0f1720; --panel:#111b27; --ink:#e6edf3; --muted:#9fb3c8;
+  --line:#213042; --tag:#1a2433; --tag-ink:#cfe3ff; --chip:#1f2a3a;
+  --accent:#4aa3ff; --ok:#0e9f6e; --warn:#f0b429; --bad:#f05252;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+}
+
+.header{padding:24px 20px 8px}
+.header h1{margin:0 0 12px;font-size:28px}
+.tags{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
+.tag{
+  background:var(--tag); color:var(--tag-ink); border:1px solid var(--line);
+  padding:6px 10px; border-radius:999px; font-size:13px;
+}
+.subtle{color:var(--muted); margin:8px 20px 0}
+
+.page .card{
+  background:var(--panel); border:1px solid var(--line);
+  margin:16px 20px; padding:14px 14px 10px; border-radius:10px;
+}
+.card h2{margin:0 0 10px;font-size:18px}
+
+.table{margin-top:8px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.table table{width:100%; border-collapse:collapse}
+.table th,.table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left}
+.table thead th{background:#0c151f; color:#cfe3ff; font-weight:600}
+.table tbody tr:hover{background:#0e1825}
+
+.grid.two{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:0 20px}
+@media (max-width:900px){.grid.two{grid-template-columns:1fr}}
+
+.muted{color:var(--muted)}
+.bullets{margin:6px 0 0 18px; padding:0}
+.bullets li{margin:6px 0}
+
+.chip{
+  padding:2px 8px;border-radius:999px;font-size:12px;display:inline-block;
+  background:var(--chip); border:1px solid var(--line); color:var(--ink)
+}
+.chip.active{background:rgba(14,159,110,.18); border-color:#165b46; color:#8df5c5}
+.chip.questionable{background:rgba(240,180,41,.14); border-color:#6b510f; color:#ffe099}
+.chip.out{background:rgba(240,82,82,.12); border-color:#723131; color:#ffb3b3}
+.chip.normal{background:rgba(64,160,255,.12); border-color:#254b74; color:#badaff}
+
+.footer{margin:20px; color:var(--muted)}
+.footer a{color:var(--accent); text-decoration:none}
+.footer a:hover{text-decoration:underline}

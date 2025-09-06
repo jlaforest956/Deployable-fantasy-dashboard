@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ meta.team }} — Weekly Fantasy Report</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="header">
+    <h1>{{ meta.team }} — Weekly Fantasy Report</h1>
+    <div class="tags">
+      <div class="tag">Week {{ meta.week }}</div>
+      <div class="tag">vs {{ meta.opponent }}</div>
+      <div class="tag">Proj: {{ '%.2f'|format(meta.proj_me) }} — {{ '%.2f'|format(meta.proj_opp) }}</div>
+      <div class="tag">Strategy: {{ meta.strategy }}</div>
+    </div>
+    <div class="subtle">Scoring: {{ meta.scoring }} — Data refreshes on load and auto-advances to ESPN’s current week.</div>
+  </div>
+
+  <div class="page">
+    <!-- Executive Summary -->
+    <section class="card">
+      <h2>Executive Summary (AI)</h2>
+      <div class="muted">{{ summary }}</div>
+    </section>
+
+    <!-- Start/Sit -->
+    <section class="card">
+      <h2>Start / Sit (Model)</h2>
+      <div class="table">
+        <table>
+          <thead>
+            <tr>
+              <th>Slot</th><th>Player</th><th>Pos</th><th>Team</th><th>Bye</th>
+              <th>Status</th><th>Live</th><th>Proj</th><th>Verdict</th><th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in start_sit_rows %}
+            <tr>
+              <td>{{ r.slot }}</td>
+              <td>{{ r.name }}</td>
+              <td>{{ r.pos }}</td>
+              <td>{{ r.team or '—' }}</td>
+              <td>{{ r.bye }}</td>
+              <td><span class="chip {{ r.status_class }}">{{ r.status }}</span></td>
+              <td>{{ r.live }}</td>
+              <td>{{ r.proj }}</td>
+              <td>{{ r.verdict }}</td>
+              <td>{{ r.reason }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Bench -->
+    <section class="card">
+      <h2>Bench (Projections)</h2>
+      <div class="table">
+        <table>
+          <thead>
+            <tr>
+              <th>Player</th><th>Pos</th><th>Team</th><th>Status</th><th>Bye</th><th>Live</th><th>Proj</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for b in bench_rows %}
+            <tr>
+              <td>{{ b.name }}</td>
+              <td>{{ b.pos }}</td>
+              <td>{{ b.team or '—' }}</td>
+              <td><span class="chip {{ b.status_class }}">{{ b.status }}</span></td>
+              <td>{{ b.bye }}</td>
+              <td>{{ b.live }}</td>
+              <td>{{ b.proj }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Two-column: Waivers / Trades -->
+    <div class="grid two">
+      <section class="card">
+        <h2>Top Waiver Targets</h2>
+        <div class="table">
+          <table>
+            <thead><tr><th>Add</th><th>Drop</th><th>Why</th></tr></thead>
+            <tbody>
+              {% for w in waivers %}
+              <tr><td>{{ w.add }}</td><td>{{ w.drop }}</td><td>{{ w.why }}</td></tr>
+              {% endfor %}
+              {% if waivers|length == 0 %}
+              <tr><td colspan="3" class="muted">No waiver advice from model.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Trade Targets</h2>
+        <div class="table">
+          <table>
+            <thead><tr><th>Target</th><th>Why</th></tr></thead>
+            <tbody>
+              {% for t in trades %}
+              <tr><td>{{ t.target }}</td><td>{{ t.why }}</td></tr>
+              {% endfor %}
+              {% if trades|length == 0 %}
+              <tr><td colspan="2" class="muted">No trade ideas right now.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- Risks -->
+    <section class="card">
+      <h2>Risk Flags</h2>
+      {% if risks and risks|length > 0 %}
+      <ul class="bullets">
+        {% for r in risks %}<li>{{ r }}</li>{% endfor %}
+      </ul>
+      {% else %}
+      <div class="muted">No major risks flagged this week.</div>
+      {% endif %}
+    </section>
+
+    <!-- Local swap ideas -->
+    <section class="card">
+      <h2>Local Bench-Swap Ideas</h2>
+      <div class="table">
+        <table>
+          <thead><tr><th>Slot</th><th>Sit</th><th>Start</th><th>Δ Proj</th></tr></thead>
+          <tbody>
+            {% for s in swaps %}
+            <tr><td>{{ s.slot }}</td><td>{{ s.sit }}</td><td>{{ s.start }}</td><td>{{ s.delta }}</td></tr>
+            {% endfor %}
+            {% if swaps|length == 0 %}
+            <tr><td colspan="4" class="muted">No clear bench upgrades this week.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="footer">
+      Deployed? Add a daily ping to this page so it refreshes its advice. ·
+      <a href="/json">View JSON</a> · <a href="/healthz">Health</a>
+    </div>
+  </div>
+</body>
+</html>
